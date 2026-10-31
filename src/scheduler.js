@@ -1,6 +1,6 @@
 import { formatSignalMessage } from "./alertGate.js";
 import { renderCrtChartPng } from "./chartImage.js";
-import { fetchCandles } from "./derivClient.js";
+import { fetchActiveInstruments, fetchCandles } from "./derivClient.js";
 import { detectCrtFormation } from "./detectors/crtDetector.js";
 import { scoreHtfContext } from "./htfScore.js";
 import { higherTimeframeFor } from "./timeframes.js";
@@ -15,6 +15,8 @@ export class BoundaryScheduler {
     this.alertGate = alertGate;
     this.timers = [];
     this.running = new Set();
+    this.marketStatusRefreshedAt = 0;
+    this.marketStatusPromise = null;
   }
 
   start() {
@@ -45,9 +47,40 @@ export class BoundaryScheduler {
       return;
     }
 
-    const chatCount = pairs.reduce((sum, pair) => sum + pair.chatIds.length, 0);
-    console.log(`[scheduler] ${timeframe.label}: checking ${pairs.length} instrument(s) for ${chatCount} chat(s)`);
-    await Promise.all(pairs.map(({ instrument, chatIds }) => this.checkPair(instrument, timeframe, chatIds)));
+    if (!(await this.refreshMarketStatuses())) {
+      console.error(`[scheduler] ${timeframe.label}: skipped because live market status is unavailable`);
+      return;
+    }
+
+    const openPairs = pairs.filter(({ instrument }) => this.instrumentBySymbol.get(instrument)?.isOpen);
+    if (openPairs.length === 0) {
+      console.log(`[scheduler] ${timeframe.label}: all enabled markets are closed`);
+      return;
+    }
+
+    const chatCount = openPairs.reduce((sum, pair) => sum + pair.chatIds.length, 0);
+    console.log(`[scheduler] ${timeframe.label}: checking ${openPairs.length} open instrument(s) for ${chatCount} chat(s)`);
+    await Promise.all(openPairs.map(({ instrument, chatIds }) => this.checkPair(instrument, timeframe, chatIds)));
+  }
+
+  async refreshMarketStatuses(now = Date.now()) {
+    if (now - this.marketStatusRefreshedAt < 60_000) return true;
+    if (!this.marketStatusPromise) {
+      this.marketStatusPromise = fetchActiveInstruments({ appId: this.config.deriv.appId })
+        .then((instruments) => {
+          this.instrumentBySymbol = new Map(instruments.map((instrument) => [instrument.symbol, instrument]));
+          this.marketStatusRefreshedAt = Date.now();
+          return true;
+        })
+        .catch((error) => {
+          console.error(`[scheduler] Could not refresh Deriv market status: ${error.message}`);
+          return false;
+        })
+        .finally(() => {
+          this.marketStatusPromise = null;
+        });
+    }
+    return this.marketStatusPromise;
   }
 
   async checkPair(symbol, timeframe, chatIds) {
@@ -64,6 +97,10 @@ export class BoundaryScheduler {
       });
 
       const closedCandles = closedOnly(candles, timeframe.seconds);
+      if (!hasFreshClosedCandle(closedCandles, timeframe.seconds)) {
+        console.log(`[scheduler] ${symbol} ${timeframe.label}: latest candle is stale; market treated as closed`);
+        return;
+      }
       const signal = detectCrtFormation(closedCandles, { symbol, timeframe });
       if (!signal) return;
 
@@ -123,4 +160,16 @@ export function msUntilNextBoundary(timeframeSeconds, nowMs = Date.now()) {
 
 function closedOnly(candles, timeframeSeconds, nowEpoch = Math.floor(Date.now() / 1000)) {
   return candles.filter((candle) => candle.epoch + timeframeSeconds <= nowEpoch);
+}
+
+export function hasFreshClosedCandle(
+  candles,
+  timeframeSeconds,
+  nowEpoch = Math.floor(Date.now() / 1000),
+  graceSeconds = 5 * 60
+) {
+  const latest = candles.at(-1);
+  if (!latest) return false;
+  const age = nowEpoch - (latest.epoch + timeframeSeconds);
+  return age >= 0 && age <= graceSeconds;
 }
