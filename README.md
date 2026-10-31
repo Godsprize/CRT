@@ -18,6 +18,7 @@ Market data uses Deriv's public WebSocket endpoint and does not require Deriv au
   - `M30` checks after each 30-minute candle closes.
   - Higher timeframes follow their matching candle boundaries.
   - `H12`, `H6`, and `H3` are built from Deriv H1 candles because Deriv does not provide those granularities directly.
+- Refreshes Deriv's live exchange status before scanning and rejects stale candles while markets are closed.
 - Sends the alert at the open of candle 3, after candles 1 and 2 form a CRT setup.
 - Sends each alert with a generated PNG chart: candle 1 high/low range is shaded blue, and candle 2 manipulation is outlined in orange.
 - Adds HTF context to each alert after a CRT is detected.
